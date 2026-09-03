@@ -1,0 +1,44 @@
+; GoldDualBasketGridEA - Default profile
+; Target account: ~$3000+ | XAUUSD M1
+; Lot plan: 0.01 0.02 0.03 0.04 0.05 ... (additive)
+; Grid step: $3 gold move | Basket target: $1 per side
+InpMagicBuy=20260901
+InpMagicSell=20260902
+InpTradeComment=GDBG
+InpBaseLot=0.01
+InpLotMode=1
+InpLotIncrement=0.01
+InpLotMultiplier=1.2
+InpMaxLotPerOrder=0.5
+InpMaxLotsPerBasket=3.0
+InpStepMode=0
+InpGridStepPrice=3.0
+InpGridStepPoints=300
+InpATRPeriod=14
+InpATRMultiplier=1.5
+InpStepWidenFactor=1.0
+InpMinStepPrice=1.0
+InpMaxPositionsPerBasket=15
+InpMinSecondsBetweenAdds=20
+InpTargetMode=0
+InpBuyTargetMoney=1.0
+InpSellTargetMoney=1.0
+InpCommissionPerLotRT=0.0
+InpUseBasketTrailing=false
+InpBasketTrailMoney=0.5
+InpOpenBothOnStart=true
+InpReopenAfterProfit=true
+InpReopenDelaySeconds=3
+InpReopenPullbackPoints=0
+InpAllowNewCycles=true
+InpMaxSpreadPoints=60
+InpUseTimeFilter=false
+InpStartHour=1
+InpEndHour=23
+InpCloseBeforeWeekend=false
+InpFridayCloseHour=21
+InpUseEquityStop=true
+InpEquityStopPercent=30.0
+InpHaltAfterEquityStop=true
+InpSlippagePoints=30
+InpShowDashboard=true

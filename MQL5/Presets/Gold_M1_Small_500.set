@@ -1,0 +1,45 @@
+; GoldDualBasketGridEA - Small account profile
+; Target account: ~$500 | XAUUSD M1
+; Fewer grid levels, wider step (widened per level), tighter equity stop.
+; Full 6-level grid = 0.21 lots at a $30.5 adverse move -> about -$234 floating.
+; The 20% equity stop ($100 on a $500 balance) fires earlier, near level 5.
+InpMagicBuy=20260901
+InpMagicSell=20260902
+InpTradeComment=GDBG
+InpBaseLot=0.01
+InpLotMode=1
+InpLotIncrement=0.01
+InpLotMultiplier=1.2
+InpMaxLotPerOrder=0.1
+InpMaxLotsPerBasket=0.5
+InpStepMode=0
+InpGridStepPrice=5.0
+InpGridStepPoints=500
+InpATRPeriod=14
+InpATRMultiplier=1.5
+InpStepWidenFactor=1.1
+InpMinStepPrice=2.0
+InpMaxPositionsPerBasket=6
+InpMinSecondsBetweenAdds=30
+InpTargetMode=0
+InpBuyTargetMoney=1.0
+InpSellTargetMoney=1.0
+InpCommissionPerLotRT=0.0
+InpUseBasketTrailing=false
+InpBasketTrailMoney=0.5
+InpOpenBothOnStart=true
+InpReopenAfterProfit=true
+InpReopenDelaySeconds=5
+InpReopenPullbackPoints=0
+InpAllowNewCycles=true
+InpMaxSpreadPoints=50
+InpUseTimeFilter=false
+InpStartHour=1
+InpEndHour=23
+InpCloseBeforeWeekend=false
+InpFridayCloseHour=21
+InpUseEquityStop=true
+InpEquityStopPercent=20.0
+InpHaltAfterEquityStop=true
+InpSlippagePoints=30
+InpShowDashboard=true
