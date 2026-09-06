@@ -206,3 +206,14 @@ EA ko beech me detach karne se open positions unmanaged reh jaati hain. Safe tar
 | `grid step is close to the current spread` warning | Step bahut chhota hai. `InpGridStepPrice` badhayein |
 
 Sab diagnostics MT5 ke **Toolbox → Experts** tab me print hote hain.
+
+
+---
+
+## Universal SMC Confluence EA (multi-asset)
+
+The repository now also includes `MQL5/Experts/UniversalSMCConfluenceEA.mq5`, a separate non-grid EA for chart-symbol trading. It combines six closed-bar analyses—SMC/market structure, FVG, order block, liquidity sweep, breakout, and confirmed-pivot trend line—with configurable confluence, risk-based volume, automatic structural/ATR SL, server-side TP of at least 1:2, break-even, and ATR trailing.
+
+Use `MQL5/Presets/Universal_SMC_M15_Conservative.set` as a starting point and read [`MQL5/Experts/README_UniversalSMCConfluenceEA.md`](MQL5/Experts/README_UniversalSMCConfluenceEA.md) before testing. Attach one instance per asset chart; the new EA supports hedging accounts and exclusive-symbol use on netting accounts, and does not use the legacy gold grid logic.
+
+This is an algorithmic framework, not a profit guarantee. Backtest and forward-test every broker/symbol configuration on demo before live deployment.
