@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //| UniversalSMCConfluenceEA.mq5                                     |
-//| Closed-bar confluence EA: SMC, FVG, order block, liquidity       |
+//| Six independent engines: SMC, FVG, order block, liquidity       |
 //| sweep, breakout and confirmed-pivot trend line.                  |
 //+------------------------------------------------------------------+
 #property copyright "KRISH-HEDEGE"
-#property version   "1.00"
+#property version   "2.00"
 #property strict
-#property description "Multi-asset confluence EA with risk-based sizing and automatic SL/TP."
+#property description "Six independent strategy orders with separate risk-based SL/TP."
 
 #include <Trade/Trade.mqh>
 
@@ -17,13 +17,21 @@ enum SignalDirection
    SIGNAL_BUY  = 1
 };
 
+enum StrategyId
+{
+   STRATEGY_SMC       = 0,
+   STRATEGY_FVG       = 1,
+   STRATEGY_OB        = 2,
+   STRATEGY_SWEEP     = 3,
+   STRATEGY_BREAKOUT  = 4,
+   STRATEGY_TRENDLINE = 5,
+   STRATEGY_COUNT     = 6
+};
+
 input group "Core settings"
 input ulong           InpMagicNumber             = 26090601;
 input ENUM_TIMEFRAMES InpSignalTimeframe         = PERIOD_M15;
-input ENUM_TIMEFRAMES InpTrendTimeframe          = PERIOD_H1;
 input int             InpHistoryBars             = 300;
-input int             InpMinimumConfluence       = 3;
-input bool            InpRequireHTFBias          = true;
 input int             InpCooldownBars            = 2;
 input int             InpMaxDeviationPoints      = 20;
 
@@ -42,7 +50,6 @@ input double          InpZoneProximityATR         = 0.20;
 input double          InpDisplacementATR          = 0.50;
 input double          InpSweepToleranceATR        = 0.03;
 input double          InpTrendLineToleranceATR    = 0.15;
-input int             InpHTFMeanPeriod            = 50;
 
 input group "Risk and exits"
 input double          InpRiskPercent              = 0.50;
@@ -86,29 +93,15 @@ struct FeatureSignal
    string label;
 };
 
-struct TradeSetup
-{
-   int    direction;
-   int    buy_votes;
-   int    sell_votes;
-   int    winning_votes;
-   double stop_reference;
-   string reasons;
-};
-
 CTrade   g_trade;
 int      g_atr_handle       = INVALID_HANDLE;
 datetime g_last_bar_time    = 0;
-datetime g_last_entry_time  = 0;
+datetime g_last_entry_time[STRATEGY_COUNT];
 string   g_status           = "Starting";
 string   g_feature_summary  = "No analysis yet";
-int      g_last_buy_votes   = 0;
-int      g_last_sell_votes  = 0;
-int      g_last_htf_bias    = SIGNAL_NONE;
+string   g_strategy_status[STRATEGY_COUNT];
+int      g_last_direction[STRATEGY_COUNT];
 double   g_last_atr         = 0.0;
-ulong    g_emergency_ticket = 0;
-bool     g_ownership_conflict = false;
-bool     g_expected_position_active = false;
 
 //+------------------------------------------------------------------+
 //| Utility helpers                                                  |
@@ -127,15 +120,56 @@ void ResetFeature(FeatureSignal &signal, const string label)
    signal.label        = label;
 }
 
-int EnabledFeatureCount()
+string StrategyName(const int strategy_id)
+{
+   switch(strategy_id)
+   {
+      case STRATEGY_SMC:       return "SMC";
+      case STRATEGY_FVG:       return "FVG";
+      case STRATEGY_OB:        return "ORDER_BLOCK";
+      case STRATEGY_SWEEP:     return "LIQUIDITY_SWEEP";
+      case STRATEGY_BREAKOUT:  return "BREAKOUT";
+      case STRATEGY_TRENDLINE: return "TRENDLINE";
+   }
+   return "UNKNOWN";
+}
+
+ulong StrategyMagic(const int strategy_id)
+{
+   return InpMagicNumber + (ulong)strategy_id;
+}
+
+int StrategyIdFromMagic(const ulong magic)
+{
+   if(magic < InpMagicNumber || magic >= InpMagicNumber + (ulong)STRATEGY_COUNT)
+      return -1;
+   return (int)(magic - InpMagicNumber);
+}
+
+bool IsStrategyMagic(const ulong magic)
+{
+   return StrategyIdFromMagic(magic) >= 0;
+}
+
+bool StrategyEnabled(const int strategy_id)
+{
+   switch(strategy_id)
+   {
+      case STRATEGY_SMC:       return InpUseSMCStructure;
+      case STRATEGY_FVG:       return InpUseFairValueGap;
+      case STRATEGY_OB:        return InpUseOrderBlock;
+      case STRATEGY_SWEEP:     return InpUseLiquiditySweep;
+      case STRATEGY_BREAKOUT:  return InpUseBreakout;
+      case STRATEGY_TRENDLINE: return InpUseTrendLine;
+   }
+   return false;
+}
+
+int EnabledStrategyCount()
 {
    int count = 0;
-   if(InpUseSMCStructure)   count++;
-   if(InpUseFairValueGap)   count++;
-   if(InpUseOrderBlock)     count++;
-   if(InpUseLiquiditySweep) count++;
-   if(InpUseBreakout)       count++;
-   if(InpUseTrendLine)      count++;
+   for(int i = 0; i < STRATEGY_COUNT; i++)
+      if(StrategyEnabled(i)) count++;
    return count;
 }
 
@@ -487,160 +521,77 @@ void DetectTrendLine(const MqlRates &rates[], const int total, const double atr,
    }
 }
 
-int HigherTimeframeBias()
+void AnalyzeStrategies(const MqlRates &rates[], const int total,
+                       const double atr, FeatureSignal &signals[])
 {
-   MqlRates trend_rates[];
-   ArraySetAsSeries(trend_rates, true);
-   const int wanted = MathMax(InpHistoryBars, InpHTFMeanPeriod + 20);
-   const int copied = CopyRates(_Symbol, InpTrendTimeframe, 0, wanted, trend_rates);
-   if(copied < InpHTFMeanPeriod + 5)
-      return SIGNAL_NONE;
-
-   double high1, high2, low1, low2;
-   int hi1, hi2, lo1, lo2;
-   const bool highs = FindTwoSwings(trend_rates, copied, true, high1, hi1, high2, hi2);
-   const bool lows  = FindTwoSwings(trend_rates, copied, false, low1, lo1, low2, lo2);
-   if(highs && lows)
+   for(int i = 0; i < STRATEGY_COUNT; i++)
    {
-      if(high1 > high2 && low1 > low2) return SIGNAL_BUY;
-      if(high1 < high2 && low1 < low2) return SIGNAL_SELL;
+      ResetFeature(signals[i], StrategyName(i));
+      g_last_direction[i] = SIGNAL_NONE;
+      if(!StrategyEnabled(i))
+         g_strategy_status[i] = "DISABLED";
+      else
+         g_strategy_status[i] = "Waiting for signal";
    }
 
-   double mean = 0.0;
-   for(int i = 1; i <= InpHTFMeanPeriod; i++)
-      mean += trend_rates[i].close;
-   mean /= InpHTFMeanPeriod;
-   if(trend_rates[1].close > mean) return SIGNAL_BUY;
-   if(trend_rates[1].close < mean) return SIGNAL_SELL;
-   return SIGNAL_NONE;
-}
+   if(InpUseSMCStructure)
+      DetectSMC(rates, total, signals[STRATEGY_SMC]);
+   if(InpUseFairValueGap)
+      DetectFVG(rates, total, atr, signals[STRATEGY_FVG]);
+   if(InpUseOrderBlock)
+      DetectOrderBlock(rates, total, atr, signals[STRATEGY_OB]);
+   if(InpUseLiquiditySweep)
+      DetectLiquiditySweep(rates, total, atr, signals[STRATEGY_SWEEP]);
+   if(InpUseBreakout)
+      DetectBreakout(rates, total, atr, signals[STRATEGY_BREAKOUT]);
+   if(InpUseTrendLine)
+      DetectTrendLine(rates, total, atr, signals[STRATEGY_TRENDLINE]);
 
-void AddFeatureVote(const FeatureSignal &feature, TradeSetup &setup,
-                    double &buy_reference, double &sell_reference)
-{
-   if(feature.direction == SIGNAL_BUY)
+   for(int i = 0; i < STRATEGY_COUNT; i++)
    {
-      setup.buy_votes++;
-      if(feature.invalidation > 0.0 &&
-         (buy_reference == 0.0 || feature.invalidation < buy_reference))
-         buy_reference = feature.invalidation;
+      g_last_direction[i] = signals[i].direction;
+      if(StrategyEnabled(i) && signals[i].direction == SIGNAL_NONE)
+         g_strategy_status[i] = ManagedPositionCount(i) > 0
+                                ? "Position open; managed independently"
+                                : "No signal";
    }
-   else if(feature.direction == SIGNAL_SELL)
-   {
-      setup.sell_votes++;
-      if(feature.invalidation > 0.0 && feature.invalidation > sell_reference)
-         sell_reference = feature.invalidation;
-   }
-}
 
-void AppendReason(const FeatureSignal &feature, const int direction, string &reasons)
-{
-   if(feature.direction != direction)
-      return;
-   if(StringLen(reasons) > 0)
-      reasons += ",";
-   reasons += feature.label;
-}
-
-bool BuildSetup(const MqlRates &rates[], const int total, const double atr,
-                TradeSetup &setup)
-{
-   setup.direction = SIGNAL_NONE;
-   setup.buy_votes = setup.sell_votes = setup.winning_votes = 0;
-   setup.stop_reference = 0.0;
-   setup.reasons = "";
-
-   FeatureSignal smc, fvg, ob, sweep, breakout, trendline;
-   ResetFeature(smc, "SMC");
-   ResetFeature(fvg, "FVG");
-   ResetFeature(ob, "OB");
-   ResetFeature(sweep, "SWEEP");
-   ResetFeature(breakout, "BREAKOUT");
-   ResetFeature(trendline, "TRENDLINE");
-
-   if(InpUseSMCStructure)   DetectSMC(rates, total, smc);
-   if(InpUseFairValueGap)   DetectFVG(rates, total, atr, fvg);
-   if(InpUseOrderBlock)     DetectOrderBlock(rates, total, atr, ob);
-   if(InpUseLiquiditySweep) DetectLiquiditySweep(rates, total, atr, sweep);
-   if(InpUseBreakout)       DetectBreakout(rates, total, atr, breakout);
-   if(InpUseTrendLine)      DetectTrendLine(rates, total, atr, trendline);
-
-   double buy_reference = 0.0;
-   double sell_reference = 0.0;
-   AddFeatureVote(smc, setup, buy_reference, sell_reference);
-   AddFeatureVote(fvg, setup, buy_reference, sell_reference);
-   AddFeatureVote(ob, setup, buy_reference, sell_reference);
-   AddFeatureVote(sweep, setup, buy_reference, sell_reference);
-   AddFeatureVote(breakout, setup, buy_reference, sell_reference);
-   AddFeatureVote(trendline, setup, buy_reference, sell_reference);
-
-   g_last_buy_votes  = setup.buy_votes;
-   g_last_sell_votes = setup.sell_votes;
-   g_last_htf_bias   = HigherTimeframeBias();
    g_feature_summary = StringFormat("SMC:%s FVG:%s OB:%s Sweep:%s Break:%s TL:%s",
-                                    DirectionText(smc.direction), DirectionText(fvg.direction),
-                                    DirectionText(ob.direction), DirectionText(sweep.direction),
-                                    DirectionText(breakout.direction), DirectionText(trendline.direction));
-
-   if(setup.buy_votes >= InpMinimumConfluence && setup.buy_votes > setup.sell_votes)
-      setup.direction = SIGNAL_BUY;
-   else if(setup.sell_votes >= InpMinimumConfluence && setup.sell_votes > setup.buy_votes)
-      setup.direction = SIGNAL_SELL;
-   else
-   {
-      g_status = StringFormat("No entry: BUY %d / SELL %d votes",
-                              setup.buy_votes, setup.sell_votes);
-      return false;
-   }
-
-   if((setup.direction == SIGNAL_BUY && !InpEnableLongTrades) ||
-      (setup.direction == SIGNAL_SELL && !InpEnableShortTrades))
-   {
-      g_status = "Confluence rejected: selected direction is disabled";
-      return false;
-   }
-   if(InpRequireHTFBias && g_last_htf_bias != setup.direction)
-   {
-      g_status = "Confluence rejected: higher-timeframe bias disagrees";
-      return false;
-   }
-
-   setup.winning_votes = setup.direction == SIGNAL_BUY ? setup.buy_votes : setup.sell_votes;
-   setup.stop_reference = setup.direction == SIGNAL_BUY ? buy_reference : sell_reference;
-   AppendReason(smc, setup.direction, setup.reasons);
-   AppendReason(fvg, setup.direction, setup.reasons);
-   AppendReason(ob, setup.direction, setup.reasons);
-   AppendReason(sweep, setup.direction, setup.reasons);
-   AppendReason(breakout, setup.direction, setup.reasons);
-   AppendReason(trendline, setup.direction, setup.reasons);
-   return true;
+                                    DirectionText(signals[STRATEGY_SMC].direction),
+                                    DirectionText(signals[STRATEGY_FVG].direction),
+                                    DirectionText(signals[STRATEGY_OB].direction),
+                                    DirectionText(signals[STRATEGY_SWEEP].direction),
+                                    DirectionText(signals[STRATEGY_BREAKOUT].direction),
+                                    DirectionText(signals[STRATEGY_TRENDLINE].direction));
 }
 
 //+------------------------------------------------------------------+
 //| Position ownership and safety filters                            |
 //+------------------------------------------------------------------+
-int ManagedPositionCount()
+int ManagedPositionCount(const int strategy_id = -1)
 {
    int count = 0;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       if(PositionGetTicket(i) == 0) continue;
-      if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
-         (ulong)PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      const ulong magic = (ulong)PositionGetInteger(POSITION_MAGIC);
+      if(strategy_id >= 0 ? magic == StrategyMagic(strategy_id) : IsStrategyMagic(magic))
          count++;
    }
    return count;
 }
 
-bool FindManagedPosition(ulong &ticket)
+bool FindStrategyPosition(const int strategy_id, ulong &ticket)
 {
    ticket = 0;
+   const ulong strategy_magic = StrategyMagic(strategy_id);
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       const ulong current = PositionGetTicket(i);
       if(current == 0) continue;
       if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
-         (ulong)PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+         (ulong)PositionGetInteger(POSITION_MAGIC) == strategy_magic)
       {
          ticket = current;
          return true;
@@ -649,26 +600,15 @@ bool FindManagedPosition(ulong &ticket)
    return false;
 }
 
-bool SymbolHasForeignPosition()
+bool HasStrategyActiveOrder(const int strategy_id)
 {
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      if(PositionGetTicket(i) == 0) continue;
-      if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
-         (ulong)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
-         return true;
-   }
-   return false;
-}
-
-bool HasManagedActiveOrder()
-{
+   const ulong strategy_magic = StrategyMagic(strategy_id);
    for(int i = OrdersTotal() - 1; i >= 0; i--)
    {
       const ulong order = OrderGetTicket(i);
       if(order == 0) continue;
       if(OrderGetString(ORDER_SYMBOL) == _Symbol &&
-         (ulong)OrderGetInteger(ORDER_MAGIC) == InpMagicNumber)
+         (ulong)OrderGetInteger(ORDER_MAGIC) == strategy_magic)
          return true;
    }
    return false;
@@ -680,19 +620,6 @@ string RiskKey(const ulong ticket)
                        AccountInfoInteger(ACCOUNT_LOGIN), ticket);
 }
 
-string EmergencyKey()
-{
-   return StringFormat("USMC.E.%I64d.%I64u",
-                       AccountInfoInteger(ACCOUNT_LOGIN), InpMagicNumber);
-}
-
-void ClearEmergencyState()
-{
-   g_emergency_ticket = 0;
-   if(GlobalVariableCheck(EmergencyKey()))
-      GlobalVariableDel(EmergencyKey());
-}
-
 double InitialRiskForPosition(const ulong ticket, const double open_price)
 {
    const string key = RiskKey(ticket);
@@ -701,6 +628,7 @@ double InitialRiskForPosition(const ulong ticket, const double open_price)
 
    if(!PositionSelectByTicket(ticket))
       return 0.0;
+   const ulong position_magic = (ulong)PositionGetInteger(POSITION_MAGIC);
    const long position_id = PositionGetInteger(POSITION_IDENTIFIER);
    if(position_id <= 0 || !HistorySelectByPosition(position_id))
       return 0.0;
@@ -712,7 +640,7 @@ double InitialRiskForPosition(const ulong ticket, const double open_price)
       const ulong order = HistoryOrderGetTicket(i);
       if(order == 0) continue;
       if(HistoryOrderGetString(order, ORDER_SYMBOL) != _Symbol) continue;
-      if((ulong)HistoryOrderGetInteger(order, ORDER_MAGIC) != InpMagicNumber) continue;
+      if((ulong)HistoryOrderGetInteger(order, ORDER_MAGIC) != position_magic) continue;
       const double order_sl = HistoryOrderGetDouble(order, ORDER_SL);
       const long setup_time = HistoryOrderGetInteger(order, ORDER_TIME_SETUP_MSC);
       if(order_sl > 0.0 && (earliest_time == 0 || setup_time < earliest_time))
@@ -785,26 +713,6 @@ bool ManagedPositionSafetyValid(const ulong ticket, string &reason)
    return true;
 }
 
-bool FindUnsafeManagedPosition(ulong &ticket, string &reason)
-{
-   ticket = 0;
-   reason = "";
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      const ulong current = PositionGetTicket(i);
-      if(current == 0) continue;
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol ||
-         (ulong)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
-         continue;
-      if(!ManagedPositionSafetyValid(current, reason))
-      {
-         ticket = current;
-         return true;
-      }
-   }
-   return false;
-}
-
 datetime StartOfServerDay()
 {
    MqlDateTime parts;
@@ -826,7 +734,7 @@ double TodayRealizedResult()
       const ulong deal = HistoryDealGetTicket(i);
       if(deal == 0) continue;
       if(HistoryDealGetString(deal, DEAL_SYMBOL) != _Symbol) continue;
-      if((ulong)HistoryDealGetInteger(deal, DEAL_MAGIC) != InpMagicNumber) continue;
+      if(!IsStrategyMagic((ulong)HistoryDealGetInteger(deal, DEAL_MAGIC))) continue;
       const long entry = HistoryDealGetInteger(deal, DEAL_ENTRY);
       result += HistoryDealGetDouble(deal, DEAL_COMMISSION);
       result += HistoryDealGetDouble(deal, DEAL_FEE);
@@ -839,24 +747,27 @@ double TodayRealizedResult()
    return result;
 }
 
-void LoadLastEntryTime()
+void LoadLastEntryTimes()
 {
-   g_last_entry_time = 0;
+   for(int strategy_id = 0; strategy_id < STRATEGY_COUNT; strategy_id++)
+      g_last_entry_time[strategy_id] = 0;
+
    const datetime from = TimeTradeServer() - 90 * 24 * 60 * 60;
    if(!HistorySelect(from, TimeTradeServer()))
       return;
+
    for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
    {
       const ulong deal = HistoryDealGetTicket(i);
       if(deal == 0) continue;
       if(HistoryDealGetString(deal, DEAL_SYMBOL) != _Symbol) continue;
-      if((ulong)HistoryDealGetInteger(deal, DEAL_MAGIC) != InpMagicNumber) continue;
+      const int strategy_id = StrategyIdFromMagic(
+         (ulong)HistoryDealGetInteger(deal, DEAL_MAGIC));
+      if(strategy_id < 0 || g_last_entry_time[strategy_id] > 0) continue;
       const long entry = HistoryDealGetInteger(deal, DEAL_ENTRY);
       if(entry == DEAL_ENTRY_IN || entry == DEAL_ENTRY_INOUT)
-      {
-         g_last_entry_time = (datetime)HistoryDealGetInteger(deal, DEAL_TIME);
-         return;
-      }
+         g_last_entry_time[strategy_id] =
+            (datetime)HistoryDealGetInteger(deal, DEAL_TIME);
    }
 }
 
@@ -875,65 +786,54 @@ bool WithinTradingHours()
    return parts.hour >= InpTradingStartHour || parts.hour < InpTradingEndHour;
 }
 
-bool EntryFiltersPass(const double atr)
+bool EntryFiltersPass(const int strategy_id, const double atr)
 {
-   if(g_ownership_conflict)
-   {
-      g_status = "Entry blocked: netting ownership conflict";
-      return false;
-   }
    if(!TerminalInfoInteger(TERMINAL_CONNECTED) ||
       !TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) ||
       !MQLInfoInteger(MQL_TRADE_ALLOWED) ||
       !AccountInfoInteger(ACCOUNT_TRADE_ALLOWED) ||
       !AccountInfoInteger(ACCOUNT_TRADE_EXPERT))
    {
-      g_status = "Entry blocked: trading/connection permission";
+      g_strategy_status[strategy_id] = "Blocked: trading/connection permission";
       return false;
    }
    if(SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE) == SYMBOL_TRADE_MODE_DISABLED)
    {
-      g_status = "Entry blocked: symbol trading disabled";
+      g_strategy_status[strategy_id] = "Blocked: symbol trading disabled";
       return false;
    }
    if(!WithinTradingHours())
    {
-      g_status = "Entry blocked: session/weekend filter";
+      g_strategy_status[strategy_id] = "Blocked: session/weekend filter";
       return false;
    }
-   if(SymbolHasForeignPosition())
+   if(HasStrategyActiveOrder(strategy_id))
    {
-      g_status = "Entry blocked: another strategy/manual position uses this symbol";
+      g_strategy_status[strategy_id] = "Blocked: own prior order is active";
       return false;
    }
-
-   if(HasManagedActiveOrder())
+   if(ManagedPositionCount(strategy_id) > 0)
    {
-      g_status = "Entry blocked: prior order is still active";
-      return false;
-   }
-   if(ManagedPositionCount() > 0)
-   {
-      g_status = "Entry blocked: managed position already open";
+      g_strategy_status[strategy_id] = "Blocked: own position already open";
       return false;
    }
 
    MqlTick tick;
    if(!SymbolInfoTick(_Symbol, tick) || tick.ask <= tick.bid || tick.time <= 0)
    {
-      g_status = "Entry blocked: invalid quote";
+      g_strategy_status[strategy_id] = "Blocked: invalid quote";
       return false;
    }
    const double spread = tick.ask - tick.bid;
    const double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    if(InpMaximumSpreadPoints > 0 && spread > InpMaximumSpreadPoints * point)
    {
-      g_status = "Entry blocked: fixed spread limit";
+      g_strategy_status[strategy_id] = "Blocked: fixed spread limit";
       return false;
    }
    if(InpMaximumSpreadATR > 0.0 && atr > 0.0 && spread > atr * InpMaximumSpreadATR)
    {
-      g_status = "Entry blocked: volatility-adjusted spread limit";
+      g_strategy_status[strategy_id] = "Blocked: ATR spread limit";
       return false;
    }
 
@@ -941,15 +841,15 @@ bool EntryFiltersPass(const double atr)
                               InpMaxDailyLossPercent / 100.0;
    if(InpMaxDailyLossPercent > 0.0 && TodayRealizedResult() <= -daily_limit)
    {
-      g_status = "Entry blocked: daily realized-loss limit";
+      g_strategy_status[strategy_id] = "Blocked: combined daily loss limit";
       return false;
    }
 
    const int seconds = PeriodSeconds(InpSignalTimeframe);
-   if(g_last_entry_time > 0 && seconds > 0 &&
-      TimeTradeServer() < g_last_entry_time + InpCooldownBars * seconds)
+   if(g_last_entry_time[strategy_id] > 0 && seconds > 0 &&
+      TimeTradeServer() < g_last_entry_time[strategy_id] + InpCooldownBars * seconds)
    {
-      g_status = "Entry blocked: cooldown";
+      g_strategy_status[strategy_id] = "Blocked: own cooldown";
       return false;
    }
    return true;
@@ -974,7 +874,7 @@ double RiskBasedVolume(const ENUM_ORDER_TYPE order_type, const double entry,
    return FloorVolume(risk_money / one_lot_loss);
 }
 
-bool BuildOrderPrices(const TradeSetup &setup, const double atr,
+bool BuildOrderPrices(const FeatureSignal &signal, const double atr,
                       double &entry, double &stop, double &target,
                       ENUM_ORDER_TYPE &order_type)
 {
@@ -983,8 +883,8 @@ bool BuildOrderPrices(const TradeSetup &setup, const double atr,
       return false;
 
    const double minimum_distance = BrokerMinimumDistance();
-   double reference = setup.stop_reference;
-   if(setup.direction == SIGNAL_BUY)
+   double reference = signal.invalidation;
+   if(signal.direction == SIGNAL_BUY)
    {
       order_type = ORDER_TYPE_BUY;
       entry = tick.ask;
@@ -999,7 +899,7 @@ bool BuildOrderPrices(const TradeSetup &setup, const double atr,
          return false;
       target = NormalizePriceToTick(entry + risk * InpMinimumRewardRisk, 1);
    }
-   else if(setup.direction == SIGNAL_SELL)
+   else if(signal.direction == SIGNAL_SELL)
    {
       order_type = ORDER_TYPE_SELL;
       entry = tick.bid;
@@ -1034,8 +934,21 @@ bool MarginIsSafe(const ENUM_ORDER_TYPE order_type, const double volume,
    return remaining_percent >= InpMinFreeMarginPercent;
 }
 
+bool SetTradeMagicFromPosition(const ulong ticket)
+{
+   if(!PositionSelectByTicket(ticket))
+      return false;
+   const ulong magic = (ulong)PositionGetInteger(POSITION_MAGIC);
+   if(!IsStrategyMagic(magic))
+      return false;
+   g_trade.SetExpertMagicNumber(magic);
+   return true;
+}
+
 bool ClosePositionConfirmed(const ulong ticket)
 {
+   if(!SetTradeMagicFromPosition(ticket))
+      return !PositionSelectByTicket(ticket);
    const bool submitted = g_trade.PositionClose(ticket);
    const bool accepted = submitted && TradeRetcodeSucceeded();
    if(accepted && !PositionSelectByTicket(ticket))
@@ -1045,51 +958,55 @@ bool ClosePositionConfirmed(const ulong ticket)
 
 void MarkEmergencyClose(const ulong ticket, const string reason)
 {
-   g_emergency_ticket = ticket;
-   GlobalVariableSet(EmergencyKey(), (double)ticket);
-   g_status = "CRITICAL: closing position - " + reason;
-   Print(g_status, ". Retcode=", g_trade.ResultRetcode(), " ",
-         g_trade.ResultRetcodeDescription());
+   int strategy_id = -1;
+   if(PositionSelectByTicket(ticket))
+      strategy_id = StrategyIdFromMagic((ulong)PositionGetInteger(POSITION_MAGIC));
+
+   const string message = "Unsafe ticket containment: " + reason;
    if(ClosePositionConfirmed(ticket))
    {
-      ClearEmergencyState();
-      g_expected_position_active = false;
-      g_status = "Unsafe position closed";
+      g_status = message + "; closed";
+      if(strategy_id >= 0)
+         g_strategy_status[strategy_id] = "Unsafe own ticket closed";
+   }
+   else
+   {
+      g_status = message + "; close will retry next tick";
+      if(strategy_id >= 0)
+         g_strategy_status[strategy_id] = "Unsafe own ticket: close retry pending";
+      Print(g_status, ". Ticket=", ticket, " Retcode=", g_trade.ResultRetcode(),
+            " ", g_trade.ResultRetcodeDescription());
    }
 }
 
-bool HandleEmergencyClose()
+void ContainUnsafePositions()
 {
-   if(g_emergency_ticket == 0)
-      return false;
-   if(!PositionSelectByTicket(g_emergency_ticket))
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      ClearEmergencyState();
-      g_expected_position_active = false;
-      g_status = "Unsafe position confirmed closed";
-      return false;
+      const ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol ||
+         !IsStrategyMagic((ulong)PositionGetInteger(POSITION_MAGIC)))
+         continue;
+
+      string reason;
+      if(!ManagedPositionSafetyValid(ticket, reason))
+         MarkEmergencyClose(ticket, reason);
    }
-   if(ClosePositionConfirmed(g_emergency_ticket))
-   {
-      ClearEmergencyState();
-      g_expected_position_active = false;
-      g_status = "Unsafe position closed on retry";
-      return false;
-   }
-   g_status = "CRITICAL: retrying emergency position close";
-   return true;
 }
 
 bool EnforcePostFillRewardRisk(const ulong ticket, const int direction,
                                const double stop, const double requested_target)
 {
-   if(!PositionSelectByTicket(ticket))
+   if(!PositionSelectByTicket(ticket) || !SetTradeMagicFromPosition(ticket))
       return false;
    const double actual_entry = PositionGetDouble(POSITION_PRICE_OPEN);
    const double current_sl   = PositionGetDouble(POSITION_SL);
    const double current_tp   = PositionGetDouble(POSITION_TP);
    const double protected_sl = current_sl > 0.0 ? current_sl : stop;
-   const double initial_risk = MathAbs(actual_entry - protected_sl);
+   double initial_risk = InitialRiskForPosition(ticket, actual_entry);
+   if(initial_risk <= 0.0)
+      initial_risk = MathAbs(actual_entry - protected_sl);
    if(initial_risk <= 0.0)
       return false;
 
@@ -1123,13 +1040,12 @@ bool EnforcePostFillRewardRisk(const ulong ticket, const int direction,
    const double verified_sl = PositionGetDouble(POSITION_SL);
    const double verified_tp = PositionGetDouble(POSITION_TP);
    const double volume      = PositionGetDouble(POSITION_VOLUME);
-   const double verified_risk = MathAbs(actual_entry - verified_sl);
    const double reward = MathAbs(verified_tp - actual_entry);
    const bool correct_side = direction == SIGNAL_BUY
-                             ? (verified_sl < actual_entry && verified_tp > actual_entry)
-                             : (verified_sl > actual_entry && verified_tp < actual_entry);
-   if(verified_sl <= 0.0 || verified_tp <= 0.0 || verified_risk <= 0.0 ||
-      !correct_side || reward + TickSize() * 1e-6 < verified_risk * InpMinimumRewardRisk)
+                             ? (verified_tp > actual_entry && verified_sl < verified_tp)
+                             : (verified_tp < actual_entry && verified_sl > verified_tp);
+   if(verified_sl <= 0.0 || verified_tp <= 0.0 ||
+      !correct_side || reward + TickSize() * 1e-6 < initial_risk * InpMinimumRewardRisk)
    {
       MarkEmergencyClose(ticket, "SL/TP verification failed");
       return false;
@@ -1149,81 +1065,109 @@ bool EnforcePostFillRewardRisk(const ulong ticket, const int direction,
       return false;
    }
 
-   GlobalVariableSet(RiskKey(ticket), verified_risk);
+   GlobalVariableSet(RiskKey(ticket), initial_risk);
    return true;
 }
 
-bool PlaceSetup(const TradeSetup &setup, const double atr)
+void ReconcileUnverifiedPositions()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      const ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol ||
+         !IsStrategyMagic((ulong)PositionGetInteger(POSITION_MAGIC)))
+         continue;
+      if(GlobalVariableCheck(RiskKey(ticket)))
+         continue;
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      const ENUM_POSITION_TYPE type =
+         (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      const int direction = type == POSITION_TYPE_BUY ? SIGNAL_BUY : SIGNAL_SELL;
+      const double stop = PositionGetDouble(POSITION_SL);
+      const double target = PositionGetDouble(POSITION_TP);
+      if(!EnforcePostFillRewardRisk(ticket, direction, stop, target))
+         Print("Delayed/recovered fill safety reconciliation failed. Ticket=", ticket);
+   }
+}
+
+bool PlaceStrategySignal(const int strategy_id, const FeatureSignal &signal,
+                         const double atr)
 {
    double entry, stop, target;
    ENUM_ORDER_TYPE order_type;
-   if(!BuildOrderPrices(setup, atr, entry, stop, target, order_type))
+   if(!BuildOrderPrices(signal, atr, entry, stop, target, order_type))
    {
-      g_status = "Signal rejected: structural stop outside configured range";
+      g_strategy_status[strategy_id] = "Rejected: invalid structural/ATR stop";
       return false;
    }
 
    const double volume = RiskBasedVolume(order_type, entry, stop);
    if(volume <= 0.0)
    {
-      g_status = "Signal rejected: broker minimum lot exceeds risk or sizing failed";
+      g_strategy_status[strategy_id] = "Rejected: lot sizing/minimum lot";
       return false;
    }
    if(!MarginIsSafe(order_type, volume, entry))
    {
-      g_status = "Signal rejected: free-margin reserve";
+      g_strategy_status[strategy_id] = "Rejected: free-margin reserve";
       return false;
    }
 
-   g_trade.SetExpertMagicNumber(InpMagicNumber);
+   const ulong strategy_magic = StrategyMagic(strategy_id);
+   g_trade.SetExpertMagicNumber(strategy_magic);
    g_trade.SetDeviationInPoints(InpMaxDeviationPoints);
    g_trade.SetTypeFillingBySymbol(_Symbol);
-   const string comment = StringFormat("USMC|%s|%d", DirectionText(setup.direction),
-                                       setup.winning_votes);
+   const string comment = StringFormat("USMC|%s|%s", StrategyName(strategy_id),
+                                       DirectionText(signal.direction));
    bool sent = false;
-   if(setup.direction == SIGNAL_BUY)
+   if(signal.direction == SIGNAL_BUY)
       sent = g_trade.Buy(volume, _Symbol, 0.0, stop, target, comment);
    else
       sent = g_trade.Sell(volume, _Symbol, 0.0, stop, target, comment);
 
    if(!sent || !TradeRetcodeSucceeded())
    {
-      g_status = StringFormat("Order failed: %u %s", g_trade.ResultRetcode(),
-                              g_trade.ResultRetcodeDescription());
-      Print(g_status);
+      g_strategy_status[strategy_id] = StringFormat("Order failed: %u %s",
+                                                    g_trade.ResultRetcode(),
+                                                    g_trade.ResultRetcodeDescription());
+      Print(StrategyName(strategy_id), ": ", g_strategy_status[strategy_id]);
       return false;
    }
 
    ulong ticket;
-   if(!FindManagedPosition(ticket))
+   if(!FindStrategyPosition(strategy_id, ticket))
    {
       if(g_trade.ResultRetcode() == TRADE_RETCODE_PLACED)
       {
-         g_expected_position_active = true;
-         g_last_entry_time = TimeTradeServer();
-         g_status = "Order accepted; awaiting broker fill and safety verification";
+         g_last_entry_time[strategy_id] = TimeTradeServer();
+         g_strategy_status[strategy_id] = "Order accepted; awaiting fill";
          return true;
       }
-      g_status = "Order reported success but no filled position was found";
+      g_strategy_status[strategy_id] = "Success reported but position not found";
       return false;
    }
-   if(!EnforcePostFillRewardRisk(ticket, setup.direction, stop, target))
+   if(!EnforcePostFillRewardRisk(ticket, signal.direction, stop, target))
    {
-      if(g_emergency_ticket == 0)
-         g_status = "Order protection verification failed";
+      g_strategy_status[strategy_id] = "Protection failed; own ticket containment started";
       return false;
    }
 
-   g_expected_position_active = true;
-   g_last_entry_time = TimeTradeServer();
-   g_status = StringFormat("%s opened: %.2f lots, %d votes, %s",
-                           DirectionText(setup.direction), volume,
-                           setup.winning_votes, setup.reasons);
-   Print(g_status, " SL=", DoubleToString(stop, (int)_Digits),
+   g_last_entry_time[strategy_id] = TimeTradeServer();
+   g_strategy_status[strategy_id] = StringFormat("%s OPEN %.2f lots",
+                                                 DirectionText(signal.direction), volume);
+   g_status = StrategyName(strategy_id) + " opened independently";
+   Print(StrategyName(strategy_id), " ", DirectionText(signal.direction),
+         " opened. Magic=", strategy_magic,
+         " Volume=", DoubleToString(volume, 2),
+         " SL=", DoubleToString(stop, (int)_Digits),
          " TP=", DoubleToString(target, (int)_Digits),
-         " minimum RR=", DoubleToString(InpMinimumRewardRisk, 2));
+         " RR>=", DoubleToString(InpMinimumRewardRisk, 2));
    if(InpEnableAlerts)
-      Alert(_Symbol, " ", g_status);
+      Alert(_Symbol, " ", StrategyName(strategy_id), " ",
+            g_strategy_status[strategy_id]);
    return true;
 }
 
@@ -1232,13 +1176,15 @@ bool PlaceSetup(const TradeSetup &setup, const double atr)
 //+------------------------------------------------------------------+
 void ManagePosition(const ulong ticket)
 {
-   if(!PositionSelectByTicket(ticket))
+   if(!PositionSelectByTicket(ticket) || !SetTradeMagicFromPosition(ticket))
       return;
 
    MqlTick tick;
    if(!SymbolInfoTick(_Symbol, tick))
       return;
 
+   const int strategy_id = StrategyIdFromMagic(
+      (ulong)PositionGetInteger(POSITION_MAGIC));
    const ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
    const double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
    const double current_sl = PositionGetDouble(POSITION_SL);
@@ -1290,33 +1236,40 @@ void ManagePosition(const ulong ticket)
    if(!submitted || !TradeRetcodeSucceeded() || !PositionSelectByTicket(ticket))
    {
       g_status = "Stop update rejected by broker";
+      if(strategy_id >= 0)
+         g_strategy_status[strategy_id] = g_status;
       return;
    }
    const double verified_sl = PositionGetDouble(POSITION_SL);
    const bool applied = buy ? verified_sl >= candidate - TickSize() * 0.5
                             : verified_sl <= candidate + TickSize() * 0.5;
    if(applied)
+   {
       g_status = StringFormat("Managing %s: %.2fR, SL tightened",
                               buy ? "BUY" : "SELL", profit_r);
+      if(strategy_id >= 0)
+         g_strategy_status[strategy_id] = StringFormat("%s open, %.2fR, SL tightened",
+                                                       buy ? "BUY" : "SELL", profit_r);
+   }
    else
+   {
       g_status = "Stop update not confirmed";
+      if(strategy_id >= 0)
+         g_strategy_status[strategy_id] = g_status;
+   }
 }
 
 void ManageOpenPositions()
 {
-   int managed = 0;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       const ulong ticket = PositionGetTicket(i);
       if(ticket == 0) continue;
       if(PositionGetString(POSITION_SYMBOL) != _Symbol ||
-         (ulong)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+         !IsStrategyMagic((ulong)PositionGetInteger(POSITION_MAGIC)))
          continue;
-      managed++;
       ManagePosition(ticket);
    }
-   if(managed == 0 && g_emergency_ticket == 0 && !HasManagedActiveOrder())
-      g_expected_position_active = false;
 }
 
 void DrawDashboard()
@@ -1326,18 +1279,26 @@ void DrawDashboard()
       Comment("");
       return;
    }
-   ulong ticket;
-   const bool has_position = FindManagedPosition(ticket);
-   const double daily = TodayRealizedResult();
-   Comment("Universal SMC Confluence EA\n",
-           "Symbol: ", _Symbol, " | Signal TF: ", EnumToString(InpSignalTimeframe),
-           " | Trend TF: ", EnumToString(InpTrendTimeframe), "\n",
-           "Votes BUY/SELL: ", g_last_buy_votes, "/", g_last_sell_votes,
-           " | HTF: ", DirectionText(g_last_htf_bias), "\n",
+
+   string strategy_lines = "";
+   for(int strategy_id = 0; strategy_id < STRATEGY_COUNT; strategy_id++)
+   {
+      strategy_lines += StringFormat("%s [%I64u] %s | positions=%d | %s\n",
+                                     StrategyName(strategy_id),
+                                     StrategyMagic(strategy_id),
+                                     DirectionText(g_last_direction[strategy_id]),
+                                     ManagedPositionCount(strategy_id),
+                                     g_strategy_status[strategy_id]);
+   }
+
+   Comment("Universal Independent Strategy EA\n",
+           "Symbol: ", _Symbol, " | Signal TF: ", EnumToString(InpSignalTimeframe), "\n",
+           "Each enabled strategy trades independently; no voting/confluence.\n",
            g_feature_summary, "\n",
+           strategy_lines,
            "ATR: ", DoubleToString(g_last_atr, (int)_Digits),
-           " | Daily result: ", DoubleToString(daily, 2),
-           " | Position: ", has_position ? "OPEN" : "FLAT", "\n",
+           " | Combined daily result: ", DoubleToString(TodayRealizedResult(), 2),
+           " | Total strategy positions: ", ManagedPositionCount(), "\n",
            "Status: ", g_status);
 }
 
@@ -1346,17 +1307,21 @@ void DrawDashboard()
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   const int enabled = EnabledFeatureCount();
-   if(InpMagicNumber == 0 || InpHistoryBars < 100 ||
-      InpSwingStrength < 1 || InpFeatureLookback < 5 ||
-      InpBreakoutLookback < 3 || InpHTFMeanPeriod < 2 ||
-      InpCooldownBars < 0 || InpMaxDeviationPoints < 0 ||
-      InpFVGMinimumATR < 0.0 || InpZoneProximityATR < 0.0 ||
-      InpDisplacementATR <= 0.0 || InpSweepToleranceATR < 0.0 ||
-      InpTrendLineToleranceATR < 0.0 || InpMinimumConfluence < 1 ||
-      InpMinimumConfluence > enabled)
+   const int enabled = EnabledStrategyCount();
+   if(AccountInfoInteger(ACCOUNT_MARGIN_MODE) != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
    {
-      Print("Invalid analysis/core inputs. Minimum confluence must be 1..", enabled);
+      Print("Independent per-strategy positions require an MT5 hedging account. ",
+            "Netting accounts merge same-symbol orders and cannot keep separate SL/TP.");
+      return INIT_FAILED;
+   }
+   if(InpMagicNumber == 0 || enabled < 1 || InpHistoryBars < 100 ||
+      InpSwingStrength < 1 || InpFeatureLookback < 5 ||
+      InpBreakoutLookback < 3 || InpCooldownBars < 0 ||
+      InpMaxDeviationPoints < 0 || InpFVGMinimumATR < 0.0 ||
+      InpZoneProximityATR < 0.0 || InpDisplacementATR <= 0.0 ||
+      InpSweepToleranceATR < 0.0 || InpTrendLineToleranceATR < 0.0)
+   {
+      Print("Invalid strategy/core inputs or no strategy is enabled.");
       return INIT_PARAMETERS_INCORRECT;
    }
    if(InpRiskPercent <= 0.0 || InpRiskPercent > 10.0 ||
@@ -1390,28 +1355,29 @@ int OnInit()
       return INIT_FAILED;
    }
 
+   for(int strategy_id = 0; strategy_id < STRATEGY_COUNT; strategy_id++)
+   {
+      g_last_direction[strategy_id] = SIGNAL_NONE;
+      g_strategy_status[strategy_id] = StrategyEnabled(strategy_id)
+                                               ? "Ready" : "DISABLED";
+   }
+
    g_trade.SetExpertMagicNumber(InpMagicNumber);
    g_trade.SetDeviationInPoints(InpMaxDeviationPoints);
    g_trade.SetTypeFillingBySymbol(_Symbol);
    g_trade.SetMarginMode();
    g_last_bar_time = iTime(_Symbol, InpSignalTimeframe, 0);
-   LoadLastEntryTime();
-   if(GlobalVariableCheck(EmergencyKey()))
-   {
-      g_emergency_ticket = (ulong)GlobalVariableGet(EmergencyKey());
-      g_expected_position_active = true;
-      g_status = "CRITICAL: recovered pending emergency close";
-   }
-   else if(ManagedPositionCount() > 0)
-   {
-      g_expected_position_active = true;
-      g_status = "Existing managed position recovered; safety check pending";
-   }
+   LoadLastEntryTimes();
+   if(ManagedPositionCount() > 0)
+      g_status = "Existing independent positions recovered; safety reconciliation pending";
    else
-      g_status = "Ready; waiting for next closed signal bar";
-   Print("Universal SMC Confluence EA ready on ", _Symbol,
-         ". Attach one instance per symbol. Enabled features=", enabled,
-         ", minimum confluence=", InpMinimumConfluence,
+      g_status = "Ready; waiting for independent strategy signals";
+
+   Print("Universal Independent Strategy EA ready on ", _Symbol,
+         ". Enabled strategies=", enabled,
+         ", magic range=", InpMagicNumber, "..",
+         InpMagicNumber + (ulong)STRATEGY_COUNT - 1,
+         ", per-strategy risk=", DoubleToString(InpRiskPercent, 2), "%",
          ", minimum RR=", DoubleToString(InpMinimumRewardRisk, 2));
    return INIT_SUCCEEDED;
 }
@@ -1433,52 +1399,39 @@ void OnTradeTransaction(const MqlTradeTransaction &transaction,
       return;
    if(HistoryDealGetString(transaction.deal, DEAL_SYMBOL) != _Symbol)
       return;
-   const ulong deal_magic = (ulong)HistoryDealGetInteger(transaction.deal, DEAL_MAGIC);
-   if(deal_magic == InpMagicNumber)
-   {
-      const long entry = HistoryDealGetInteger(transaction.deal, DEAL_ENTRY);
-      if(entry == DEAL_ENTRY_IN || entry == DEAL_ENTRY_INOUT)
-      {
-         g_expected_position_active = true;
-         g_status = "Fill received; safety verification pending";
-      }
-      return;
-   }
-   if(AccountInfoInteger(ACCOUNT_MARGIN_MODE) == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
+
+   const int strategy_id = StrategyIdFromMagic(
+      (ulong)HistoryDealGetInteger(transaction.deal, DEAL_MAGIC));
+   if(strategy_id < 0)
       return;
 
-   if(g_expected_position_active)
+   const long entry = HistoryDealGetInteger(transaction.deal, DEAL_ENTRY);
+   if(entry == DEAL_ENTRY_IN || entry == DEAL_ENTRY_INOUT)
    {
-      g_ownership_conflict = true;
-      g_status = "CRITICAL: foreign deal merged with netting symbol; management paused";
-      Print(g_status, ". Deal=", transaction.deal);
-      if(InpEnableAlerts)
-         Alert(_Symbol, " ", g_status);
+      g_last_entry_time[strategy_id] =
+         (datetime)HistoryDealGetInteger(transaction.deal, DEAL_TIME);
+      g_strategy_status[strategy_id] = "Fill received; safety check pending";
+
+      ulong ticket;
+      if(FindStrategyPosition(strategy_id, ticket) &&
+         !GlobalVariableCheck(RiskKey(ticket)) && PositionSelectByTicket(ticket))
+      {
+         const ENUM_POSITION_TYPE type =
+            (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+         const int direction = type == POSITION_TYPE_BUY ? SIGNAL_BUY : SIGNAL_SELL;
+         EnforcePostFillRewardRisk(ticket, direction,
+                                   PositionGetDouble(POSITION_SL),
+                                   PositionGetDouble(POSITION_TP));
+      }
    }
+   else if(entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_OUT_BY)
+      g_strategy_status[strategy_id] = "Position closed; ready after cooldown";
 }
 
 void OnTick()
 {
-   if(HandleEmergencyClose())
-   {
-      DrawDashboard();
-      return;
-   }
-   if(g_ownership_conflict)
-   {
-      DrawDashboard();
-      return;
-   }
-
-   ulong unsafe_ticket;
-   string unsafe_reason;
-   if(FindUnsafeManagedPosition(unsafe_ticket, unsafe_reason))
-   {
-      MarkEmergencyClose(unsafe_ticket, unsafe_reason);
-      DrawDashboard();
-      return;
-   }
-
+   ReconcileUnverifiedPositions();
+   ContainUnsafePositions();
    ManageOpenPositions();
 
    const datetime current_bar = iTime(_Symbol, InpSignalTimeframe, 0);
@@ -1501,8 +1454,7 @@ void OnTick()
    MqlRates rates[];
    ArraySetAsSeries(rates, true);
    const int copied = CopyRates(_Symbol, InpSignalTimeframe, 0, InpHistoryBars, rates);
-   const int minimum_bars = MathMax(InpHTFMeanPeriod,
-                                    MathMax(InpFeatureLookback, InpBreakoutLookback)) +
+   const int minimum_bars = MathMax(InpFeatureLookback, InpBreakoutLookback) +
                             InpSwingStrength * 2 + 10;
    if(copied < minimum_bars)
    {
@@ -1511,14 +1463,34 @@ void OnTick()
       return;
    }
 
-   TradeSetup setup;
-   if(!BuildSetup(rates, copied, atr, setup))
+   FeatureSignal signals[STRATEGY_COUNT];
+   AnalyzeStrategies(rates, copied, atr, signals);
+
+   int signal_count = 0;
+   int order_count = 0;
+   for(int strategy_id = 0; strategy_id < STRATEGY_COUNT; strategy_id++)
    {
-      DrawDashboard();
-      return;
+      if(!StrategyEnabled(strategy_id) || signals[strategy_id].direction == SIGNAL_NONE)
+         continue;
+
+      signal_count++;
+      if((signals[strategy_id].direction == SIGNAL_BUY && !InpEnableLongTrades) ||
+         (signals[strategy_id].direction == SIGNAL_SELL && !InpEnableShortTrades))
+      {
+         g_strategy_status[strategy_id] = "Blocked: signal direction disabled";
+         continue;
+      }
+
+      if(EntryFiltersPass(strategy_id, atr) &&
+         PlaceStrategySignal(strategy_id, signals[strategy_id], atr))
+         order_count++;
    }
 
-   if(EntryFiltersPass(atr))
-      PlaceSetup(setup, atr);
+   if(order_count > 0)
+      g_status = StringFormat("Independent orders opened this bar: %d", order_count);
+   else if(signal_count > 0)
+      g_status = StringFormat("Independent signals this bar: %d; see strategy status", signal_count);
+   else
+      g_status = "No independent strategy signal on the closed bar";
    DrawDashboard();
 }

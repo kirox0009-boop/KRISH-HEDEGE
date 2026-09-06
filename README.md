@@ -210,10 +210,12 @@ Sab diagnostics MT5 ke **Toolbox → Experts** tab me print hote hain.
 
 ---
 
-## Universal SMC Confluence EA (multi-asset)
+## Universal Independent Strategy EA (multi-asset)
 
-The repository now also includes `MQL5/Experts/UniversalSMCConfluenceEA.mq5`, a separate non-grid EA for chart-symbol trading. It combines six closed-bar analyses—SMC/market structure, FVG, order block, liquidity sweep, breakout, and confirmed-pivot trend line—with configurable confluence, risk-based volume, automatic structural/ATR SL, server-side TP of at least 1:2, break-even, and ATR trailing.
+The repository also includes `MQL5/Experts/UniversalSMCConfluenceEA.mq5` version 2.00, a separate non-grid EA for chart-symbol trading. Despite the compatibility filename, voting/confluence has been removed. SMC, FVG, order block, liquidity sweep, breakout, and trend-line engines now evaluate and trade independently.
 
-Use `MQL5/Presets/Universal_SMC_M15_Conservative.set` as a starting point and read [`MQL5/Experts/README_UniversalSMCConfluenceEA.md`](MQL5/Experts/README_UniversalSMCConfluenceEA.md) before testing. Attach one instance per asset chart; the new EA supports hedging accounts and exclusive-symbol use on netting accounts, and does not use the legacy gold grid logic.
+If several strategies meet their own conditions on the same closed candle, each can place a separate ticket with its own derived magic number, risk-sized volume, structural/ATR SL, TP of at least 1:2, break-even, and ATR trailing. One strategy's position or cooldown does not block another strategy.
 
-This is an algorithmic framework, not a profit guarantee. Backtest and forward-test every broker/symbol configuration on demo before live deployment.
+A **hedging account is required** because MT5 netting accounts merge same-symbol trades and cannot retain separate per-strategy SL/TP. Use `MQL5/Presets/Universal_SMC_M15_Conservative.set` as a starting point and read [`MQL5/Experts/README_UniversalSMCConfluenceEA.md`](MQL5/Experts/README_UniversalSMCConfluenceEA.md) before testing.
+
+`InpRiskPercent` applies to every independent order, so simultaneous strategy signals add their risk. This is an algorithmic framework, not a profit guarantee. Compile in MetaEditor, then backtest and forward-test every broker/symbol configuration on demo before live deployment.
