@@ -1,11 +1,9 @@
-; UniversalSMCConfluenceEA conservative starting profile
+; Universal Independent Strategy EA conservative starting profile
+; HEDGING ACCOUNT REQUIRED: each enabled strategy keeps its own order, SL and TP.
 ; Attach one EA instance to each symbol's chart. Backtest and optimize per broker/symbol.
 InpMagicNumber=26090601
 InpSignalTimeframe=15
-InpTrendTimeframe=16385
 InpHistoryBars=300
-InpMinimumConfluence=3
-InpRequireHTFBias=true
 InpCooldownBars=2
 InpMaxDeviationPoints=20
 InpUseSMCStructure=true
@@ -22,7 +20,6 @@ InpZoneProximityATR=0.20
 InpDisplacementATR=0.50
 InpSweepToleranceATR=0.03
 InpTrendLineToleranceATR=0.15
-InpHTFMeanPeriod=50
 InpRiskPercent=0.50
 InpUseEquityForRisk=true
 InpMinimumRewardRisk=2.00

@@ -1,63 +1,106 @@
-# Universal SMC Confluence EA for MT5
+# Universal Independent Strategy EA for MT5
 
-`UniversalSMCConfluenceEA.mq5` is a direction-only, risk-based Expert Advisor. It evaluates six independent feature families on completed candles, requires configurable directional confluence, calculates a structural/ATR stop, and places a server-side TP of at least 2R. It does **not** use grid averaging, martingale, simultaneous hedging, or a guaranteed-profit model.
+> The source filename remains `UniversalSMCConfluenceEA.mq5` for compatibility with the existing pull request, but version 2.00 has **no voting or confluence gate**.
+
+This EA runs six completely independent strategy engines on completed candles:
+
+1. SMC / market structure
+2. Fair Value Gap (FVG)
+3. Order Block
+4. Liquidity Sweep
+5. Breakout
+6. Confirmed-pivot Trend Line
+
+## Independent-order behavior
+
+Every enabled strategy is evaluated separately on every newly closed `InpSignalTimeframe` candle. If several strategies signal on the same candle, the EA attempts every qualifying order in that candle; one strategy's open position does not block the others.
+
+Each strategy has its own:
+
+- magic number;
+- open-position check;
+- cooldown;
+- order comment and dashboard status;
+- signal direction and invalidation level;
+- risk-based volume calculation;
+- server-side SL and TP;
+- break-even and ATR trailing management.
+
+The EA permits one open position per strategy on a symbol. An existing SMC position blocks only another SMC entry; FVG, order block, sweep, breakout, and trend-line entries remain eligible. Opposite strategy directions can coexist.
+
+There is no vote count, minimum-confluence setting, winning signal, shared direction selection, or higher-timeframe agreement requirement.
+
+## Magic-number mapping
+
+`InpMagicNumber` is the base. The six independent strategy magics are:
+
+| Offset | Strategy | Default magic |
+|---:|---|---:|
+| +0 | SMC | 26090601 |
+| +1 | FVG | 26090602 |
+| +2 | Order Block | 26090603 |
+| +3 | Liquidity Sweep | 26090604 |
+| +4 | Breakout | 26090605 |
+| +5 | Trend Line | 26090606 |
+
+Choose a base range that does not overlap another EA instance.
+
+## Hedging account is required
+
+MT5 **hedging mode is mandatory** for this version. A netting account merges all orders for the same symbol into one position, making separate per-strategy SL, TP, direction, ticket, and management impossible. The EA therefore refuses initialization on netting/exchange accounts rather than silently merging strategies.
 
 ## Strategy definitions
 
-All entry analysis uses closed bars on `InpSignalTimeframe`; confirmed pivots require bars on both sides and therefore do not use future information after confirmation.
+- **SMC:** confirmed swing highs/lows establish HH/HL or LH/LL structure; a completed-candle swing break can generate a directional signal.
+- **FVG:** a three-candle wick imbalance must exceed the configured ATR width and price must be at/near a still-valid zone.
+- **Order Block:** the final opposing candle before ATR-qualified displacement forms the zone; intervening closes through invalidation cancel it.
+- **Liquidity Sweep:** the signal candle trades beyond the recent range extreme and closes back inside.
+- **Breakout:** the signal candle closes beyond the recent range with body and ATR displacement requirements.
+- **Trend Line:** two confirmed rising lows or falling highs project support/resistance; the completed candle must reject the line within ATR tolerance.
 
-1. **SMC / market structure:** confirmed swing highs and lows establish HH/HL or LH/LL structure. A closed-candle break of a confirmed swing is treated as BOS; the opposing swing supplies invalidation.
-2. **Fair value gap (FVG):** a three-candle wick imbalance must exceed `InpFVGMinimumATR`. The zone remains usable until a candle closes through its invalidation and price is at/near the zone.
-3. **Order block:** the final opposing candle before an ATR-qualified displacement is used as the zone. Price must remain near that candle and on its valid side.
-4. **Liquidity sweep:** the signal candle must trade beyond the recent lookback extreme and close back inside it.
-5. **Breakout:** the candle must close beyond the recent range with a minimum body and volatility buffer.
-6. **Trend line:** two confirmed rising swing lows form bullish support; two falling swing highs form bearish resistance. The completed candle must reject the projected line within ATR tolerance.
+All entry detectors use completed bars and confirmed pivots. There is no current-candle entry signal.
 
-Each enabled family contributes at most one vote. A trade needs `InpMinimumConfluence` votes in one direction, more votes than the opposite direction, and—by default—matching H1 structure/mean bias. The dashboard shows every current feature direction and the rejection reason.
+## SL, TP and risk
 
-## SL, TP and lot calculation
+Each strategy order calculates protection from **that strategy's own invalidation**:
 
-- The initial SL is placed beyond the deepest matching feature invalidation plus `InpStopBufferATR`. If a valid structural reference is unavailable, an ATR fallback is used.
-- Stops are aligned to the symbol's trade tick size and expanded when needed to satisfy the broker's stop level.
-- Setups wider than `InpMaximumStopATR` are rejected.
-- `InpMinimumRewardRisk` cannot be configured below `2.0`. TP is calculated from actual risk and checked again after the fill. If slippage makes TP less than the configured R multiple, TP is moved outward. If protection cannot be verified, the EA attempts to close the position.
-- Volume is calculated from equity or balance risk using `OrderCalcProfit`, then floored to the broker's volume step. If the broker minimum lot would exceed the risk budget, no trade is placed. After the fill, actual money risk is recalculated; the position is closed if slippage exceeds `InpMaximumRiskOvershootPct` above the budget.
-- Margin reserve, fixed/ATR spread filters, cooldown, session/weekend lock, one-position-per-symbol, and daily realized-loss controls can block new entries. Existing positions continue to be managed.
+- SL is placed beyond its signal invalidation plus `InpStopBufferATR`; ATR fallback is used only when needed.
+- Stop distance is normalized to the symbol's tick size and broker stop/freeze requirements.
+- TP is at least `InpMinimumRewardRisk`, which cannot be configured below `2.0`.
+- Post-fill code rechecks the actual entry, SL, TP and money risk. An unsafe ticket is contained and retried independently on following ticks/restart scans without blocking healthy strategies.
+- Volume is calculated independently for each order through `OrderCalcProfit` and floored to the broker's volume step.
+- Break-even and ATR trailing operate by ticket and only tighten that ticket's SL.
 
-Break-even can activate at 1R. ATR trailing can activate later; both only tighten risk and never deliberately widen the stop. Initial R is stored in an MT5 terminal global variable and recovered from the original position-order history when available. Every owned ticket is safety-checked on startup and during operation; if initial risk or required server protection cannot be verified, the EA persists an emergency-close state and retries containment after restart.
+`InpRiskPercent` is **per strategy order**, not divided among strategies. At the default 0.5%, six simultaneous entries can initially risk approximately 3% plus slippage/gaps. Reduce it to about 0.15–0.25% if that combined exposure is too high. The combined daily realized-loss filter covers all six strategy magic numbers.
 
 ## Install and run
 
-1. Copy `MQL5/Experts/UniversalSMCConfluenceEA.mq5` into the terminal's `MQL5/Experts` directory.
-2. Compile it in MetaEditor.
-3. Open the desired asset chart and attach one EA instance. The chart period itself may differ; the EA reads `InpSignalTimeframe` and `InpTrendTimeframe` explicitly.
-4. Load `MQL5/Presets/Universal_SMC_M15_Conservative.set` as a conservative starting profile.
-5. Enable Algo Trading and confirm the Experts log says the EA is ready.
-6. For several assets, attach one instance per symbol. Use a different `InpMagicNumber` for another instance on the same symbol. On netting accounts, reserve the entire symbol exclusively for this EA while its position is open: MT5 merges all deals on a symbol, so manual or foreign-EA deals cannot be managed independently. The EA blocks foreign positions before entry and pauses management with a critical alert if it detects a later foreign deal merged into its active netting symbol.
+1. Use an MT5 hedging account.
+2. Copy `MQL5/Experts/UniversalSMCConfluenceEA.mq5` into the terminal's `MQL5/Experts` folder and compile it in MetaEditor.
+3. Attach one instance to the desired asset chart.
+4. Load `MQL5/Presets/Universal_SMC_M15_Conservative.set`.
+5. Ensure the base magic range `InpMagicNumber` through `InpMagicNumber + 5` is unused by another instance.
+6. Enable Algo Trading and confirm the Experts log reports independent-strategy mode.
+7. Attach separate instances to other asset charts with non-overlapping magic ranges.
 
 ### Hindi quick start
 
-EA ko desired asset ke chart par attach karein, preset load karein, aur pehle Strategy Tester/demo par verify karein. Har symbol ke liye alag chart instance use karein. Same symbol par doosra instance ho to unique magic number dein. Default risk 0.5% per trade aur minimum TP 1:2 hai.
+Bot me voting hata di gayi hai. Har strategy apna signal milne par apna alag order, SL aur TP lagati hai. Ek strategy ka running trade baaki strategies ko block nahi karta. Same symbol par alag positions aur SL/TP ke liye hedging account zaroori hai. Default risk 0.5% **har strategy order** ka hai; agar chhe signals ek saath aayein to combined initial risk lagbhag 3% ho sakta hai.
 
-## Broker and asset portability
+## Shared safety filters
 
-The code reads each current chart symbol's digits, point, tick size, tick value through `OrderCalcProfit`, minimum/maximum/step volume, stop/freeze levels, filling policy, live spread, and margin requirement. It supports directional operation on hedging accounts and on netting accounts where the symbol is reserved exclusively for this EA. Symbol suffixes such as `EURUSD.a` or `XAUUSDm` require no hard-coded name.
+Session/weekend, spread, free-margin reserve, long/short enable flags, and combined daily-loss controls remain shared safety gates. These can block an otherwise valid strategy signal, but a position or cooldown belonging to one strategy cannot block another strategy.
 
-“Portable” does not mean one parameter set is suitable everywhere. Forex, metals, indices, energy, equities, and crypto CFDs have different sessions, gaps, volatility, spreads, contract specifications, and minimum lots. Optimize thresholds and timeframes separately for each broker-symbol pair.
+## Validation required
 
-## Recommended validation
+Before live use, compile in MetaEditor and use Strategy Tester with **Every tick based on real ticks**. Verify:
 
-Before live use, run MT5 Strategy Tester with **Every tick based on real ticks** and visual mode. Check at least:
+- multiple strategies that signal on one closed candle create multiple tickets;
+- every ticket has the expected strategy magic, its own SL, and its own TP;
+- an open SMC ticket does not prevent another strategy's order;
+- every initial TP remains at least 2R after fill;
+- each strategy's cooldown affects only that strategy;
+- break-even/trailing modifies only the intended ticket;
+- combined exposure and margin remain acceptable when several signals occur together.
 
-- entries occur only after a signal candle closes;
-- the log/dashboard reports at least the configured number of matching families;
-- every accepted fill has a server-side SL and TP at or beyond 2R;
-- risk money remains close to the configured percentage for that symbol;
-- spread, daily-loss, cooldown, Friday, and foreign-position locks work;
-- break-even/trailing never move SL away from profit;
-- behavior survives terminal restart with an open position;
-- results remain acceptable out of sample and across different market regimes.
-
-## Important limitations
-
-No SMC, FVG, breakout, or trend-line definition guarantees profitable trades. Backtests can overfit, execution can gap beyond SL, and broker data/contract rules vary. The daily loss guard covers realized deals for this EA's symbol and magic; it is not an account-wide kill switch. The EA manages one owned position per symbol and intentionally does not pyramid or average losses. Use demo/forward testing and capital you can afford to risk. No profitability claim is made.
+No strategy guarantees profit. Broker execution, gaps, spread, contract specifications, and market regimes vary. Backtest and demo-forward-test each broker/symbol configuration before live trading.
